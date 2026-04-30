@@ -152,9 +152,17 @@ def _find_best_chain(
 
 
 def find_project_dir(project_path: str | None) -> Path:
-    if project_path:
-        return Path(project_path).expanduser()
-    return PROJECTS_DIR
+    if not project_path:
+        return PROJECTS_DIR
+    p = Path(project_path).expanduser().resolve()
+    # If the path exists but contains no jsonl files, treat it as a working
+    # directory and map it to the corresponding Claude project folder.
+    if p.exists() and not any(p.rglob("*.jsonl")):
+        encoded = str(p).replace("/", "-")
+        candidate = PROJECTS_DIR / encoded
+        if candidate.exists():
+            return candidate
+    return p
 
 
 def find_session_file(session_id: str, project_path: str | None) -> tuple[Path, Path] | None:
@@ -185,9 +193,14 @@ def cmd_diagnose(args):
         print("No session files found.")
         return
 
-    # Group by first-level project dir, stable-sort within each group by path.
+    top_level_scan = base == PROJECTS_DIR
+
+    # When scanning PROJECTS_DIR, group by first-level project dir.
+    # When scanning a specific project dir, group by immediate subdir only.
     def sort_key(p: Path) -> tuple[str, Path]:
-        return (p.relative_to(base).parts[0], p)
+        parts = p.relative_to(base).parts
+        group = parts[0] if top_level_scan else (parts[0] if len(parts) > 1 else "")
+        return (group, p)
 
     files = sorted(files, key=sort_key)
 
@@ -202,18 +215,25 @@ def cmd_diagnose(args):
     )
     rule = "  " + "-" * (len(header) - 2)
 
-    current_project: str | None = None
+    current_group: str | None = None
 
     for path in files:
         parts = path.relative_to(base).parts
-        project = parts[0]
-        # subdir: everything between the project root and the file itself
-        subdir = "/".join(parts[1:-1]) if len(parts) > 2 else ""
+
+        if top_level_scan:
+            group = parts[0]
+            group_label = f"{group}/"
+            subdir = "/".join(parts[1:-1]) if len(parts) > 2 else ""
+        else:
+            group = parts[0] if len(parts) > 1 else ""
+            group_label = f"{group}/" if group else "(project root)"
+            subdir = "/".join(parts[1:-1]) if len(parts) > 2 else ""
+
         subdir_display = (subdir[:17] + "...") if len(subdir) > 20 else subdir
 
-        if project != current_project:
-            current_project = project
-            print(f"\n{project}/")
+        if group != current_group:
+            current_group = group
+            print(f"\n{group_label}")
             print(header)
             print(rule)
 
