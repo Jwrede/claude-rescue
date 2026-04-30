@@ -32,17 +32,22 @@ def iter_jsonl(path: Path):
                 print(f"  warning: skipping malformed line {lineno} in {path.name}", file=sys.stderr)
 
 
-def diagnose_file(path: Path) -> tuple[int, int, int]:
+def diagnose_file(path: Path) -> tuple[int, int, int, str]:
     """
-    Stream through a file and return (entry_count, root_count, broken_count).
+    Stream through a file and return (entry_count, root_count, broken_count, title).
     Only keeps uuid/parentUuid strings in memory — not full entry dicts.
     """
     uuids: set[str] = set()
     parents: dict[str, str] = {}  # uuid -> parentUuid
     entry_count = 0
+    title = ""
 
     for _lineno, entry in iter_jsonl(path):
         entry_count += 1
+        if not title:
+            lp = entry.get("lastPrompt")
+            if lp:
+                title = lp.strip().replace("\n", " ")
         uid = entry.get("uuid")
         if not uid:
             continue
@@ -56,7 +61,7 @@ def diagnose_file(path: Path) -> tuple[int, int, int]:
 
     broken = sum(1 for p in parents.values() if p not in uuids)
 
-    return entry_count, root_count, broken
+    return entry_count, root_count, broken, title
 
 
 def _build_chain_index(path: Path) -> tuple[dict[str, list[str]], dict[str, int], int]:
@@ -206,14 +211,14 @@ def cmd_diagnose(args):
 
     files = sorted(files, key=sort_key)
 
-    col_w = [36, 20, 7, 6, 7, 12]
+    col_w = [36, 7, 6, 7, 12, 40]
     header = (
         f"  {'Session ID':<{col_w[0]}}  "
-        f"{'Subdir':<{col_w[1]}}  "
-        f"{'Entries':>{col_w[2]}}  "
-        f"{'Roots':>{col_w[3]}}  "
-        f"{'Broken':>{col_w[4]}}  "
-        f"{'Status':<{col_w[5]}}"
+        f"{'Entries':>{col_w[1]}}  "
+        f"{'Roots':>{col_w[2]}}  "
+        f"{'Broken':>{col_w[3]}}  "
+        f"{'Status':<{col_w[4]}}  "
+        f"{'Last prompt':<{col_w[5]}}"
     )
     rule = "  " + "-" * (len(header) - 2)
 
@@ -225,13 +230,9 @@ def cmd_diagnose(args):
         if top_level_scan:
             group = parts[0]
             group_label = f"{group}/"
-            subdir = "/".join(parts[1:-1]) if len(parts) > 2 else ""
         else:
             group = parts[0] if len(parts) > 1 else ""
             group_label = f"{group}/" if group else "(project root)"
-            subdir = "/".join(parts[1:-1]) if len(parts) > 2 else ""
-
-        subdir_display = (subdir[:17] + "...") if len(subdir) > 20 else subdir
 
         if group != current_group:
             current_group = group
@@ -240,7 +241,7 @@ def cmd_diagnose(args):
             print(rule)
 
         session_id = path.stem
-        entry_count, root_count, broken = diagnose_file(path)
+        entry_count, root_count, broken, title = diagnose_file(path)
 
         if broken > 0:
             status = "✗ corrupted"
@@ -249,13 +250,15 @@ def cmd_diagnose(args):
         else:
             status = "✓ healthy"
 
+        title_display = (title[:37] + "...") if len(title) > 40 else title
+
         print(
             f"  {session_id:<{col_w[0]}}  "
-            f"{subdir_display:<{col_w[1]}}  "
-            f"{entry_count:>{col_w[2]}}  "
-            f"{root_count:>{col_w[3]}}  "
-            f"{broken:>{col_w[4]}}  "
-            f"{status:<{col_w[5]}}"
+            f"{entry_count:>{col_w[1]}}  "
+            f"{root_count:>{col_w[2]}}  "
+            f"{broken:>{col_w[3]}}  "
+            f"{status:<{col_w[4]}}  "
+            f"{title_display:<{col_w[5]}}"
         )
 
 
