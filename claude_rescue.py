@@ -2,11 +2,18 @@
 """claude-rescue: Diagnose and recover corrupted Claude Code session JSONL files."""
 
 import argparse
+import gc
 import json
+import re
 import sys
 import uuid
 from collections import defaultdict
 from pathlib import Path
+
+# Extracts "uuid" and "parentUuid" from a raw JSONL line without full JSON parse.
+# Safe because these fields are always plain strings (no escapes needed).
+_RE_UUID = re.compile(rb'"uuid"\s*:\s*"([^"]+)"')
+_RE_PARENT = re.compile(rb'"parentUuid"\s*:\s*"([^"]+)"')
 
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -54,24 +61,29 @@ def diagnose_file(path: Path) -> tuple[int, int, int]:
 
 def _build_chain_index(path: Path) -> tuple[dict[str, list[str]], dict[str, int], int]:
     """
-    First pass: read only uuid/parentUuid to build the chain structure.
+    First pass: extract only uuid/parentUuid via regex on raw bytes — no JSON parse.
     Returns (children, last_lineno_by_uuid, meta_count).
-    last_lineno_by_uuid tracks the highest line number seen for each uuid
-    (used to rank chains by recency without storing full entries).
     """
     children: dict[str, list[str]] = defaultdict(list)
     last_lineno: dict[str, int] = {}
     meta_count = 0
 
-    for lineno, entry in iter_jsonl(path):
-        uid = entry.get("uuid")
-        if not uid:
-            meta_count += 1
-            continue
-        last_lineno[uid] = lineno
-        parent = entry.get("parentUuid")
-        if parent:
-            children[parent].append(uid)
+    with open(path, "rb") as f:
+        for lineno, raw in enumerate(f):
+            raw = raw.strip()
+            if not raw:
+                continue
+            m = _RE_UUID.search(raw)
+            if not m:
+                meta_count += 1
+                continue
+            uid = m.group(1).decode()
+            last_lineno[uid] = lineno
+            mp = _RE_PARENT.search(raw)
+            if mp:
+                parent = mp.group(1).decode()
+                if parent != "null":
+                    children[parent].append(uid)
 
     return children, last_lineno, meta_count
 
@@ -204,20 +216,21 @@ def cmd_diagnose(args):
         )
 
 
-def cmd_recover(args):
-    result = find_session_file(args.session_id, args.project)
-    if result is None:
-        print(f"Session file not found for ID: {args.session_id}", file=sys.stderr)
-        sys.exit(1)
-
-    project_dir, session_file = result
-
-    # Pass 1: build chain index from uuid/parentUuid only (no full entry storage)
-    children, last_lineno, meta_count = _build_chain_index(session_file)
+def _recover_file(
+    session_file: Path,
+    project_dir: Path,
+    pick: bool = False,
+    in_place: bool = False,
+) -> tuple[int, int, int, Path | None, str | None]:
+    """
+    Run the two-pass recovery on session_file.
+    Returns (root_count, written_entries, written_meta, out_path, new_id).
+    out_path/new_id are None if root_count <= 1 (no recovery needed).
+    """
+    children, last_lineno, _meta_count = _build_chain_index(session_file)
 
     if not last_lineno:
-        print("No chains found — file may be empty or contain no valid entries.", file=sys.stderr)
-        sys.exit(1)
+        return 0, 0, 0, None, None
 
     all_uuids = set(last_lineno.keys())
     child_uuids: set[str] = set()
@@ -226,20 +239,24 @@ def cmd_recover(args):
     root_count = len(all_uuids - child_uuids)
 
     if root_count <= 1:
-        print("Session has only one chain — no recovery needed.")
-        print(f"Session ID: {args.session_id}")
-        return
+        return root_count, 0, 0, None, None
 
-    selected_uuids, ranked = _find_best_chain(children, last_lineno, args.pick)
+    selected_uuids, _ranked = _find_best_chain(children, last_lineno, pick)
 
-    # Pass 2: stream the file again, writing only selected entries
-    new_id = str(uuid.uuid4())
-    out_path = project_dir / f"{new_id}.jsonl"
+    if in_place:
+        bak_path = session_file.with_suffix(".jsonl.bak")
+        session_file.rename(bak_path)
+        out_path = session_file
+        new_id = None
+    else:
+        new_id = str(uuid.uuid4())
+        out_path = project_dir / f"{new_id}.jsonl"
+        bak_path = session_file
 
     written_meta = 0
     written_entries = 0
     with open(out_path, "w", encoding="utf-8") as f:
-        for _lineno, entry in iter_jsonl(session_file):
+        for _lineno, entry in iter_jsonl(bak_path):
             uid = entry.get("uuid")
             if not uid:
                 f.write(json.dumps(entry) + "\n")
@@ -248,11 +265,80 @@ def cmd_recover(args):
                 f.write(json.dumps(entry) + "\n")
                 written_entries += 1
 
+    return root_count, written_entries, written_meta, out_path, new_id
+
+
+def cmd_recover(args):
+    result = find_session_file(args.session_id, args.project)
+    if result is None:
+        print(f"Session file not found for ID: {args.session_id}", file=sys.stderr)
+        sys.exit(1)
+
+    project_dir, session_file = result
+    root_count, written_entries, written_meta, out_path, new_id = _recover_file(
+        session_file, project_dir, pick=args.pick
+    )
+
+    if root_count == 0:
+        print("No chains found — file may be empty or contain no valid entries.", file=sys.stderr)
+        sys.exit(1)
+
+    if out_path is None:
+        print("Session has only one chain — no recovery needed.")
+        print(f"Session ID: {args.session_id}")
+        return
+
     print(f"Recovered {written_entries} entries ({written_meta} metadata lines) to:")
     print(f"  {out_path}")
-    print()
-    print(f"Resume with:")
-    print(f"  claude --resume {new_id}")
+    if new_id:
+        print()
+        print(f"Resume with:")
+        print(f"  claude --resume {new_id}")
+
+
+def cmd_recover_all(args):
+    base = find_project_dir(args.project_path)
+    if not base.exists():
+        print(f"Directory not found: {base}", file=sys.stderr)
+        sys.exit(1)
+
+    files = sorted(
+        f for f in base.rglob("*.jsonl")
+        if not f.name.endswith(".bak") and not f.name.endswith(".recovered.jsonl")
+    )
+
+    recovered = skipped = errors = 0
+
+    for session_file in files:
+        session_id = session_file.stem
+        is_acompact = "acompact" in session_id
+        in_place = is_acompact or args.in_place
+
+        try:
+            root_count, written_entries, written_meta, out_path, new_id = _recover_file(
+                session_file, session_file.parent, in_place=in_place
+            )
+        except Exception as e:
+            print(f"  error: {session_id}: {e}", file=sys.stderr)
+            errors += 1
+            gc.collect()
+            continue
+
+        gc.collect()
+
+        if out_path is None:
+            skipped += 1
+            continue
+
+        recovered += 1
+        if in_place:
+            print(f"  recovered (in-place): {session_id}  ({written_entries} entries)")
+        else:
+            print(f"  recovered: {session_id} -> {new_id}  ({written_entries} entries)")
+            if not args.quiet:
+                print(f"    resume with: claude --resume {new_id}")
+
+    print(f"\nDone: {recovered} recovered, {skipped} already healthy, {errors} errors.")
 
 
 def main():
@@ -288,6 +374,28 @@ def main():
         help="Project directory containing the session file.",
     )
     p_rec.set_defaults(func=cmd_recover)
+
+    # recover-all
+    p_all = sub.add_parser("recover-all", help="Recover all fragmented sessions in batch.")
+    p_all.add_argument(
+        "project_path",
+        nargs="?",
+        default=None,
+        metavar="PROJECT_PATH",
+        help=f"Directory to scan (default: {PROJECTS_DIR})",
+    )
+    p_all.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Overwrite originals (backup as .bak) instead of writing new UUID files. "
+             "Always used automatically for agent-acompact-* files.",
+    )
+    p_all.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress per-file resume hints.",
+    )
+    p_all.set_defaults(func=cmd_recover_all)
 
     args = parser.parse_args()
     args.func(args)
