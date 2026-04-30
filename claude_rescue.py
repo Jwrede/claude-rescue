@@ -186,7 +186,9 @@ def cmd_diagnose(args):
 
     files = sorted(
         f for f in base.rglob("*.jsonl")
-        if not f.name.endswith(".bak") and not f.name.endswith(".recovered.jsonl")
+        if not f.name.endswith(".bak")
+        and not f.name.endswith(".recovered.jsonl")
+        and (args.subagents or "subagents" not in f.parts)
     )
 
     if not files:
@@ -397,6 +399,11 @@ def main():
         default=None,
         metavar="PROJECT_PATH",
         help=f"Directory to scan (default: {PROJECTS_DIR})",
+    )
+    p_diag.add_argument(
+        "--subagents",
+        action="store_true",
+        help="Include subagent and compaction files in output.",
     )
     p_diag.set_defaults(func=cmd_diagnose)
 
