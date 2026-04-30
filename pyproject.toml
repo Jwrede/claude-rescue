@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "claude-rescue"
+version = "0.1.0"
+description = "Diagnose and recover corrupted Claude Code session JSONL files"
+requires-python = ">=3.10"
+
+[project.scripts]
+claude-rescue = "claude_rescue:main"
