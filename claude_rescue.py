@@ -396,9 +396,9 @@ def main():
     p_diag.add_argument(
         "project_path",
         nargs="?",
-        default=None,
+        default=".",
         metavar="PROJECT_PATH",
-        help=f"Directory to scan (default: {PROJECTS_DIR})",
+        help="Directory to scan (default: current directory)",
     )
     p_diag.add_argument(
         "--subagents",
