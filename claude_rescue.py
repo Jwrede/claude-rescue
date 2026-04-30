@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """claude-rescue: Diagnose and recover corrupted Claude Code session JSONL files."""
 
+__version__ = "0.2.0"
+
 import argparse
 import gc
 import hashlib
@@ -458,11 +460,51 @@ def cmd_recover_all(args):
     print(f"\nDone: {recovered} recovered, {skipped} skipped, {errors} errors.")
 
 
+def cmd_prune_acompact(args):
+    base = find_project_dir(args.project_path)
+    if not base.exists():
+        print(f"Directory not found: {base}", file=sys.stderr)
+        sys.exit(1)
+
+    targets = [
+        f for f in base.rglob("*")
+        if f.is_file()
+        and "acompact" in f.name
+        and any(f.name.endswith(ext) for ext in (".jsonl", ".jsonl.bak", ".jsonl.rescued"))
+    ]
+
+    if not targets:
+        print("No compaction files found.")
+        return
+
+    total_bytes = sum(f.stat().st_size for f in targets)
+
+    if args.dry_run:
+        for f in sorted(targets):
+            print(f"  would delete: {f}")
+        print(f"\n{len(targets)} files, {total_bytes / 1024 / 1024:.1f} MB")
+        return
+
+    for f in targets:
+        f.unlink()
+
+    # Remove directories that are now empty (subagents/ and their parents).
+    for d in sorted(base.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if d.is_dir():
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+
+    print(f"Deleted {len(targets)} files, freed {total_bytes / 1024 / 1024:.1f} MB.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="claude-rescue",
         description="Diagnose and recover corrupted Claude Code session JSONL files.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # diagnose
@@ -518,6 +560,22 @@ def main():
         help="Suppress per-file resume hints.",
     )
     p_all.set_defaults(func=cmd_recover_all)
+
+    # prune-acompact
+    p_prune = sub.add_parser("prune-acompact", help="Delete all compaction sidechain files.")
+    p_prune.add_argument(
+        "project_path",
+        nargs="?",
+        default=".",
+        metavar="PROJECT_PATH",
+        help="Directory to scan (default: current directory)",
+    )
+    p_prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be deleted without deleting anything.",
+    )
+    p_prune.set_defaults(func=cmd_prune_acompact)
 
     args = parser.parse_args()
     args.func(args)

@@ -4,9 +4,32 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-rescue"
-version = "0.1.0"
+version = "0.2.0"
 description = "Diagnose and recover corrupted Claude Code session JSONL files"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Jonathan Wrede", email = "wrede.jonathan00@gmail.com"}]
+keywords = ["claude", "claude-code", "session", "recovery", "anthropic", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
 requires-python = ">=3.10"
+
+[project.optional-dependencies]
+test = ["pytest"]
 
 [project.scripts]
 claude-rescue = "claude_rescue:main"
+
+[project.urls]
+Homepage = "https://github.com/Jwrede/claude-rescue"
+Repository = "https://github.com/Jwrede/claude-rescue"
+Issues = "https://github.com/Jwrede/claude-rescue/issues"
