@@ -185,18 +185,38 @@ def cmd_diagnose(args):
         print("No session files found.")
         return
 
-    col_w = [36, 7, 6, 7, 12]
+    # Group by first-level project dir, stable-sort within each group by path.
+    def sort_key(p: Path) -> tuple[str, Path]:
+        return (p.relative_to(base).parts[0], p)
+
+    files = sorted(files, key=sort_key)
+
+    col_w = [36, 20, 7, 6, 7, 12]
     header = (
-        f"{'Session ID':<{col_w[0]}}  "
-        f"{'Entries':>{col_w[1]}}  "
-        f"{'Roots':>{col_w[2]}}  "
-        f"{'Broken':>{col_w[3]}}  "
-        f"{'Status':<{col_w[4]}}"
+        f"  {'Session ID':<{col_w[0]}}  "
+        f"{'Subdir':<{col_w[1]}}  "
+        f"{'Entries':>{col_w[2]}}  "
+        f"{'Roots':>{col_w[3]}}  "
+        f"{'Broken':>{col_w[4]}}  "
+        f"{'Status':<{col_w[5]}}"
     )
-    print(header)
-    print("-" * len(header))
+    rule = "  " + "-" * (len(header) - 2)
+
+    current_project: str | None = None
 
     for path in files:
+        parts = path.relative_to(base).parts
+        project = parts[0]
+        # subdir: everything between the project root and the file itself
+        subdir = "/".join(parts[1:-1]) if len(parts) > 2 else ""
+        subdir_display = (subdir[:17] + "...") if len(subdir) > 20 else subdir
+
+        if project != current_project:
+            current_project = project
+            print(f"\n{project}/")
+            print(header)
+            print(rule)
+
         session_id = path.stem
         entry_count, root_count, broken = diagnose_file(path)
 
@@ -208,11 +228,12 @@ def cmd_diagnose(args):
             status = "✓ healthy"
 
         print(
-            f"{session_id:<{col_w[0]}}  "
-            f"{entry_count:>{col_w[1]}}  "
-            f"{root_count:>{col_w[2]}}  "
-            f"{broken:>{col_w[3]}}  "
-            f"{status:<{col_w[4]}}"
+            f"  {session_id:<{col_w[0]}}  "
+            f"{subdir_display:<{col_w[1]}}  "
+            f"{entry_count:>{col_w[2]}}  "
+            f"{root_count:>{col_w[3]}}  "
+            f"{broken:>{col_w[4]}}  "
+            f"{status:<{col_w[5]}}"
         )
 
 
