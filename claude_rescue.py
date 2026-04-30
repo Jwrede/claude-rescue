@@ -3,7 +3,6 @@
 
 import argparse
 import json
-import os
 import sys
 import uuid
 from collections import defaultdict
@@ -21,41 +20,68 @@ def iter_jsonl(path: Path):
             if not raw:
                 continue
             try:
-                entry = json.loads(raw)
-                entry["_lineno"] = lineno
-                yield lineno, entry
+                yield lineno, json.loads(raw)
             except json.JSONDecodeError:
                 print(f"  warning: skipping malformed line {lineno} in {path.name}", file=sys.stderr)
 
 
-def build_chains(entries: list[dict]) -> dict[str, list[dict]]:
+def diagnose_file(path: Path) -> tuple[int, int, int]:
     """
-    Build chains from entries that have a uuid field.
-    Returns a dict mapping root_uuid -> [list of entries in chain order].
-    Entries without uuid are excluded from chain logic.
+    Stream through a file and return (entry_count, root_count, broken_count).
+    Only keeps uuid/parentUuid strings in memory — not full entry dicts.
     """
-    by_uuid: dict[str, dict] = {}
-    children: dict[str, list[str]] = defaultdict(list)
+    uuids: set[str] = set()
+    parents: dict[str, str] = {}  # uuid -> parentUuid
+    entry_count = 0
 
-    for entry in entries:
+    for _lineno, entry in iter_jsonl(path):
+        entry_count += 1
         uid = entry.get("uuid")
         if not uid:
             continue
-        by_uuid[uid] = entry
+        uuids.add(uid)
+        parent = entry.get("parentUuid")
+        if parent:
+            parents[uid] = parent
+
+    child_uuids = set(parents.values()) & uuids
+    root_count = len(uuids - child_uuids)
+
+    broken = sum(1 for p in parents.values() if p not in uuids)
+
+    return entry_count, root_count, broken
+
+
+def build_chains(path: Path) -> tuple[dict[str, list[tuple[int, dict]]], list[tuple[int, dict]]]:
+    """
+    Stream through a file and build chains.
+    Returns (chains, meta_entries) where:
+      chains: root_uuid -> [(lineno, entry), ...]
+      meta_entries: [(lineno, entry), ...] for entries without a uuid
+    """
+    by_uuid: dict[str, tuple[int, dict]] = {}
+    children: dict[str, list[str]] = defaultdict(list)
+    meta_entries: list[tuple[int, dict]] = []
+
+    for lineno, entry in iter_jsonl(path):
+        uid = entry.get("uuid")
+        if not uid:
+            meta_entries.append((lineno, entry))
+            continue
+        by_uuid[uid] = (lineno, entry)
         parent = entry.get("parentUuid")
         if parent:
             children[parent].append(uid)
 
     all_uuids = set(by_uuid.keys())
-    child_uuids = set()
+    child_uuids: set[str] = set()
     for kids in children.values():
         child_uuids.update(kids)
-
     roots = all_uuids - child_uuids
 
-    chains: dict[str, list[dict]] = {}
+    chains: dict[str, list[tuple[int, dict]]] = {}
     for root in roots:
-        chain = []
+        chain: list[tuple[int, dict]] = []
         stack = [root]
         while stack:
             current = stack.pop()
@@ -66,18 +92,7 @@ def build_chains(entries: list[dict]) -> dict[str, list[dict]]:
                 stack.append(child)
         chains[root] = chain
 
-    return chains
-
-
-def count_broken_links(entries: list[dict]) -> int:
-    """Count parentUuid references that point to non-existent uuids."""
-    all_uuids = {e["uuid"] for e in entries if "uuid" in e}
-    broken = 0
-    for entry in entries:
-        parent = entry.get("parentUuid")
-        if parent and parent not in all_uuids:
-            broken += 1
-    return broken
+    return chains, meta_entries
 
 
 def find_project_dir(project_path: str | None) -> Path:
@@ -127,11 +142,7 @@ def cmd_diagnose(args):
 
     for path in files:
         session_id = path.stem
-        entries = [e for _, e in iter_jsonl(path)]
-        chains = build_chains(entries)
-        root_count = len(chains)
-        broken = count_broken_links(entries)
-        entry_count = len(entries)
+        entry_count, root_count, broken = diagnose_file(path)
 
         if broken > 0:
             status = "✗ corrupted"
@@ -156,8 +167,7 @@ def cmd_recover(args):
         sys.exit(1)
 
     project_dir, session_file = result
-    entries = [e for _, e in iter_jsonl(session_file)]
-    chains = build_chains(entries)
+    chains, meta_entries = build_chains(session_file)
 
     if not chains:
         print("No chains found — file may be empty or contain no valid entries.", file=sys.stderr)
@@ -165,24 +175,22 @@ def cmd_recover(args):
 
     if len(chains) == 1:
         print("Session has only one chain — no recovery needed.")
-        root = next(iter(chains))
         print(f"Session ID: {args.session_id}")
         return
 
-    # Rank chains: highest max(_lineno) wins
+    # Rank chains: highest max(lineno) wins (most recently written)
     ranked = sorted(
         chains.items(),
-        key=lambda kv: max((e.get("_lineno", 0) for e in kv[1]), default=0),
+        key=lambda kv: max((ln for ln, _ in kv[1]), default=0),
         reverse=True,
     )
 
     if args.pick:
         print(f"Found {len(ranked)} chains:\n")
         for i, (root, chain) in enumerate(ranked):
-            max_line = max((e.get("_lineno", 0) for e in chain), default=0)
-            # show a preview of the last entry's type/content
-            last = max(chain, key=lambda e: e.get("_lineno", 0))
-            preview = last.get("type") or last.get("role") or "(unknown)"
+            max_line = max((ln for ln, _ in chain), default=0)
+            _, last_entry = max(chain, key=lambda t: t[0])
+            preview = last_entry.get("type") or last_entry.get("role") or "(unknown)"
             print(f"  [{i + 1}] root={root[:8]}...  entries={len(chain)}  last_line={max_line}  last_type={preview}")
 
         print()
@@ -199,20 +207,13 @@ def cmd_recover(args):
     else:
         selected_root, selected_chain = ranked[0]
 
-    # Gather non-uuid entries (metadata) to prepend
-    meta_entries = [e for e in entries if "uuid" not in e]
-
-    # Strip internal _lineno before writing
-    def clean(e: dict) -> dict:
-        return {k: v for k, v in e.items() if k != "_lineno"}
-
-    output_entries = [clean(e) for e in meta_entries] + [clean(e) for e in selected_chain]
-
     new_id = str(uuid.uuid4())
     out_path = project_dir / f"{new_id}.jsonl"
 
     with open(out_path, "w", encoding="utf-8") as f:
-        for entry in output_entries:
+        for _ln, entry in meta_entries:
+            f.write(json.dumps(entry) + "\n")
+        for _ln, entry in selected_chain:
             f.write(json.dumps(entry) + "\n")
 
     print(f"Recovered {len(selected_chain)} entries ({len(meta_entries)} metadata lines) to:")
