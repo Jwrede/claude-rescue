@@ -52,47 +52,91 @@ def diagnose_file(path: Path) -> tuple[int, int, int]:
     return entry_count, root_count, broken
 
 
-def build_chains(path: Path) -> tuple[dict[str, list[tuple[int, dict]]], list[tuple[int, dict]]]:
+def _build_chain_index(path: Path) -> tuple[dict[str, list[str]], dict[str, int], int]:
     """
-    Stream through a file and build chains.
-    Returns (chains, meta_entries) where:
-      chains: root_uuid -> [(lineno, entry), ...]
-      meta_entries: [(lineno, entry), ...] for entries without a uuid
+    First pass: read only uuid/parentUuid to build the chain structure.
+    Returns (children, last_lineno_by_uuid, meta_count).
+    last_lineno_by_uuid tracks the highest line number seen for each uuid
+    (used to rank chains by recency without storing full entries).
     """
-    by_uuid: dict[str, tuple[int, dict]] = {}
     children: dict[str, list[str]] = defaultdict(list)
-    meta_entries: list[tuple[int, dict]] = []
+    last_lineno: dict[str, int] = {}
+    meta_count = 0
 
     for lineno, entry in iter_jsonl(path):
         uid = entry.get("uuid")
         if not uid:
-            meta_entries.append((lineno, entry))
+            meta_count += 1
             continue
-        by_uuid[uid] = (lineno, entry)
+        last_lineno[uid] = lineno
         parent = entry.get("parentUuid")
         if parent:
             children[parent].append(uid)
 
-    all_uuids = set(by_uuid.keys())
+    return children, last_lineno, meta_count
+
+
+def _find_best_chain(
+    children: dict[str, list[str]],
+    last_lineno: dict[str, int],
+    pick: bool,
+) -> tuple[set[str], list[tuple[str, int, int]]]:
+    """
+    Walk the chain tree (index only) and return (best_uuid_set, ranked_summaries).
+    ranked_summaries: [(root_uuid, entry_count, max_lineno), ...] highest-recency first.
+    """
+    all_uuids = set(last_lineno.keys())
     child_uuids: set[str] = set()
     for kids in children.values():
         child_uuids.update(kids)
     roots = all_uuids - child_uuids
 
-    chains: dict[str, list[tuple[int, dict]]] = {}
+    summaries: list[tuple[str, int, int]] = []
     for root in roots:
-        chain: list[tuple[int, dict]] = []
         stack = [root]
+        chain_uuids: list[str] = []
         while stack:
-            current = stack.pop()
-            if current not in by_uuid:
+            cur = stack.pop()
+            if cur not in last_lineno:
                 continue
-            chain.append(by_uuid[current])
-            for child in children.get(current, []):
+            chain_uuids.append(cur)
+            for child in children.get(cur, []):
                 stack.append(child)
-        chains[root] = chain
+        max_ln = max((last_lineno[u] for u in chain_uuids), default=0)
+        summaries.append((root, len(chain_uuids), max_ln))
 
-    return chains, meta_entries
+    ranked = sorted(summaries, key=lambda t: t[2], reverse=True)
+
+    if pick and len(ranked) > 1:
+        print(f"Found {len(ranked)} chains:\n")
+        for i, (root, count, max_ln) in enumerate(ranked):
+            print(f"  [{i + 1}] root={root[:8]}...  entries={count}  last_line={max_ln}")
+        print()
+        while True:
+            try:
+                choice = int(input(f"Pick chain [1-{len(ranked)}]: "))
+                if 1 <= choice <= len(ranked):
+                    selected_root, _, _ = ranked[choice - 1]
+                    break
+                print(f"Please enter a number between 1 and {len(ranked)}.")
+            except (ValueError, EOFError):
+                print("Invalid input.", file=sys.stderr)
+                sys.exit(1)
+    else:
+        selected_root = ranked[0][0]
+
+    # Collect the uuid set for the selected chain
+    stack = [selected_root]
+    selected_uuids: set[str] = set()
+    while stack:
+        cur = stack.pop()
+        if cur not in last_lineno:
+            continue
+        selected_uuids.add(cur)
+        for child in children.get(cur, []):
+            stack.append(child)
+
+    return selected_uuids, ranked
 
 
 def find_project_dir(project_path: str | None) -> Path:
@@ -167,56 +211,44 @@ def cmd_recover(args):
         sys.exit(1)
 
     project_dir, session_file = result
-    chains, meta_entries = build_chains(session_file)
 
-    if not chains:
+    # Pass 1: build chain index from uuid/parentUuid only (no full entry storage)
+    children, last_lineno, meta_count = _build_chain_index(session_file)
+
+    if not last_lineno:
         print("No chains found — file may be empty or contain no valid entries.", file=sys.stderr)
         sys.exit(1)
 
-    if len(chains) == 1:
+    all_uuids = set(last_lineno.keys())
+    child_uuids: set[str] = set()
+    for kids in children.values():
+        child_uuids.update(kids)
+    root_count = len(all_uuids - child_uuids)
+
+    if root_count <= 1:
         print("Session has only one chain — no recovery needed.")
         print(f"Session ID: {args.session_id}")
         return
 
-    # Rank chains: highest max(lineno) wins (most recently written)
-    ranked = sorted(
-        chains.items(),
-        key=lambda kv: max((ln for ln, _ in kv[1]), default=0),
-        reverse=True,
-    )
+    selected_uuids, ranked = _find_best_chain(children, last_lineno, args.pick)
 
-    if args.pick:
-        print(f"Found {len(ranked)} chains:\n")
-        for i, (root, chain) in enumerate(ranked):
-            max_line = max((ln for ln, _ in chain), default=0)
-            _, last_entry = max(chain, key=lambda t: t[0])
-            preview = last_entry.get("type") or last_entry.get("role") or "(unknown)"
-            print(f"  [{i + 1}] root={root[:8]}...  entries={len(chain)}  last_line={max_line}  last_type={preview}")
-
-        print()
-        while True:
-            try:
-                choice = int(input(f"Pick chain [1-{len(ranked)}]: "))
-                if 1 <= choice <= len(ranked):
-                    selected_root, selected_chain = ranked[choice - 1]
-                    break
-                print(f"Please enter a number between 1 and {len(ranked)}.")
-            except (ValueError, EOFError):
-                print("Invalid input.", file=sys.stderr)
-                sys.exit(1)
-    else:
-        selected_root, selected_chain = ranked[0]
-
+    # Pass 2: stream the file again, writing only selected entries
     new_id = str(uuid.uuid4())
     out_path = project_dir / f"{new_id}.jsonl"
 
+    written_meta = 0
+    written_entries = 0
     with open(out_path, "w", encoding="utf-8") as f:
-        for _ln, entry in meta_entries:
-            f.write(json.dumps(entry) + "\n")
-        for _ln, entry in selected_chain:
-            f.write(json.dumps(entry) + "\n")
+        for _lineno, entry in iter_jsonl(session_file):
+            uid = entry.get("uuid")
+            if not uid:
+                f.write(json.dumps(entry) + "\n")
+                written_meta += 1
+            elif uid in selected_uuids:
+                f.write(json.dumps(entry) + "\n")
+                written_entries += 1
 
-    print(f"Recovered {len(selected_chain)} entries ({len(meta_entries)} metadata lines) to:")
+    print(f"Recovered {written_entries} entries ({written_meta} metadata lines) to:")
     print(f"  {out_path}")
     print()
     print(f"Resume with:")
