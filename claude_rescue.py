@@ -3,6 +3,7 @@
 
 import argparse
 import gc
+import hashlib
 import json
 import re
 import sys
@@ -91,6 +92,41 @@ def _build_chain_index(path: Path) -> tuple[dict[str, list[str]], dict[str, int]
                     children[parent].append(uid)
 
     return children, last_lineno, meta_count
+
+
+def _get_last_prompt(path: Path) -> str:
+    """Return the first lastPrompt value found in the file, or empty string."""
+    for _, entry in iter_jsonl(path):
+        lp = entry.get("lastPrompt")
+        if lp:
+            return lp.strip().replace("\n", " ")
+    return ""
+
+
+def _chain_fingerprint(uuids: set[str]) -> str:
+    return hashlib.md5(",".join(sorted(uuids)).encode()).hexdigest()[:16]
+
+
+def _sidecar_path(session_file: Path) -> Path:
+    return session_file.with_suffix(".jsonl.rescued")
+
+
+def _read_sidecar(session_file: Path) -> tuple[str, str] | None:
+    """Return (recovered_id, fingerprint) from sidecar, or None if absent/invalid."""
+    sp = _sidecar_path(session_file)
+    if not sp.exists():
+        return None
+    try:
+        data = json.loads(sp.read_text())
+        return data["recovered_id"], data["fingerprint"]
+    except Exception:
+        return None
+
+
+def _write_sidecar(session_file: Path, recovered_id: str, fingerprint: str) -> None:
+    _sidecar_path(session_file).write_text(
+        json.dumps({"recovered_id": recovered_id, "fingerprint": fingerprint})
+    )
 
 
 def _find_best_chain(
@@ -267,16 +303,17 @@ def _recover_file(
     project_dir: Path,
     pick: bool = False,
     in_place: bool = False,
-) -> tuple[int, int, int, Path | None, str | None]:
+) -> tuple[int, int, int, Path | None, str | None, bool]:
     """
     Run the two-pass recovery on session_file.
-    Returns (root_count, written_entries, written_meta, out_path, new_id).
-    out_path/new_id are None if root_count <= 1 (no recovery needed).
+    Returns (root_count, written_entries, written_meta, out_path, new_id, already_recovered).
+    out_path/new_id are None if root_count <= 1 or already recovered with same chain.
+    already_recovered is True when a prior recovery with the same chain fingerprint exists.
     """
     children, last_lineno, _meta_count = _build_chain_index(session_file)
 
     if not last_lineno:
-        return 0, 0, 0, None, None
+        return 0, 0, 0, None, None, False
 
     all_uuids = set(last_lineno.keys())
     child_uuids: set[str] = set()
@@ -285,9 +322,19 @@ def _recover_file(
     root_count = len(all_uuids - child_uuids)
 
     if root_count <= 1:
-        return root_count, 0, 0, None, None
+        return root_count, 0, 0, None, None, False
 
     selected_uuids, _ranked = _find_best_chain(children, last_lineno, pick)
+
+    # Duplicate check: skip if same chain was already recovered and file still exists.
+    if not in_place:
+        fp = _chain_fingerprint(selected_uuids)
+        sidecar = _read_sidecar(session_file)
+        if sidecar is not None:
+            existing_id, existing_fp = sidecar
+            existing_path = project_dir / f"{existing_id}.jsonl"
+            if existing_fp == fp and existing_path.exists():
+                return root_count, 0, 0, existing_path, existing_id, True
 
     if in_place:
         bak_path = session_file.with_suffix(".jsonl.bak")
@@ -295,6 +342,7 @@ def _recover_file(
         out_path = session_file
         new_id = None
     else:
+        fp = _chain_fingerprint(selected_uuids)
         new_id = str(uuid.uuid4())
         out_path = project_dir / f"{new_id}.jsonl"
         bak_path = session_file
@@ -311,7 +359,10 @@ def _recover_file(
                 f.write(json.dumps(entry) + "\n")
                 written_entries += 1
 
-    return root_count, written_entries, written_meta, out_path, new_id
+    if new_id:
+        _write_sidecar(session_file, new_id, fp)
+
+    return root_count, written_entries, written_meta, out_path, new_id, False
 
 
 def cmd_recover(args):
@@ -321,13 +372,23 @@ def cmd_recover(args):
         sys.exit(1)
 
     project_dir, session_file = result
-    root_count, written_entries, written_meta, out_path, new_id = _recover_file(
+    last_prompt = _get_last_prompt(session_file)
+    root_count, written_entries, written_meta, out_path, new_id, already_recovered = _recover_file(
         session_file, project_dir, pick=args.pick
     )
+
+    if last_prompt:
+        print(f"Last prompt: {last_prompt[:120]}")
+        print()
 
     if root_count == 0:
         print("No chains found — file may be empty or contain no valid entries.", file=sys.stderr)
         sys.exit(1)
+
+    if already_recovered:
+        print(f"Already recovered (chain unchanged) as: {new_id}")
+        print(f"Resume with: claude --resume {new_id}")
+        return
 
     if out_path is None:
         print("Session has only one chain — no recovery needed.")
@@ -350,7 +411,8 @@ def cmd_recover_all(args):
 
     files = sorted(
         f for f in base.rglob("*.jsonl")
-        if not f.name.endswith(".bak") and not f.name.endswith(".recovered.jsonl")
+        if not f.name.endswith(".bak")
+        and not f.name.endswith(".recovered.jsonl")
     )
 
     recovered = skipped = errors = 0
@@ -361,7 +423,7 @@ def cmd_recover_all(args):
         in_place = is_acompact or args.in_place
 
         try:
-            root_count, written_entries, written_meta, out_path, new_id = _recover_file(
+            root_count, written_entries, written_meta, out_path, new_id, already_recovered = _recover_file(
                 session_file, session_file.parent, in_place=in_place
             )
         except Exception as e:
@@ -376,15 +438,24 @@ def cmd_recover_all(args):
             skipped += 1
             continue
 
+        last_prompt = _get_last_prompt(session_file)
+        prompt_suffix = f'  "{last_prompt[:60]}"' if last_prompt else ""
+
+        if already_recovered:
+            skipped += 1
+            if not args.quiet:
+                print(f"  already recovered: {session_id} -> {new_id}{prompt_suffix}")
+            continue
+
         recovered += 1
         if in_place:
-            print(f"  recovered (in-place): {session_id}  ({written_entries} entries)")
+            print(f"  recovered (in-place): {session_id}  ({written_entries} entries){prompt_suffix}")
         else:
-            print(f"  recovered: {session_id} -> {new_id}  ({written_entries} entries)")
+            print(f"  recovered: {session_id} -> {new_id}  ({written_entries} entries){prompt_suffix}")
             if not args.quiet:
                 print(f"    resume with: claude --resume {new_id}")
 
-    print(f"\nDone: {recovered} recovered, {skipped} already healthy, {errors} errors.")
+    print(f"\nDone: {recovered} recovered, {skipped} skipped, {errors} errors.")
 
 
 def main():
