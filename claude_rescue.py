@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """claude-rescue: Diagnose and recover corrupted Claude Code session JSONL files."""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 import argparse
 import gc
@@ -47,10 +47,9 @@ def diagnose_file(path: Path) -> tuple[int, int, int, str]:
 
     for _lineno, entry in iter_jsonl(path):
         entry_count += 1
-        if not title:
-            lp = entry.get("lastPrompt")
-            if lp:
-                title = lp.strip().replace("\n", " ")
+        lp = entry.get("lastPrompt")
+        if lp:
+            title = lp.strip().replace("\n", " ")
         uid = entry.get("uuid")
         if not uid:
             continue
@@ -97,12 +96,17 @@ def _build_chain_index(path: Path) -> tuple[dict[str, list[str]], dict[str, int]
 
 
 def _get_last_prompt(path: Path) -> str:
-    """Return the first lastPrompt value found in the file, or empty string."""
+    """Return the last lastPrompt value found in the file, or empty string.
+
+    `lastPrompt` is updated per-entry as the conversation progresses, so the
+    final occurrence reflects the current title shown by `claude resume`.
+    """
+    title = ""
     for _, entry in iter_jsonl(path):
         lp = entry.get("lastPrompt")
         if lp:
-            return lp.strip().replace("\n", " ")
-    return ""
+            title = lp.strip().replace("\n", " ")
+    return title
 
 
 def _chain_fingerprint(uuids: set[str]) -> str:

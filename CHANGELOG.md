@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.1] - 2026-05-01
+
+### Fixed
+- `diagnose`, `recover`, and `recover-all` now show the *last* `lastPrompt` value in the session, matching the title displayed by `claude resume`. Previously the first occurrence was shown, which reflected an early state of the conversation.
+
 ## [0.2.0] - 2026-04-30
 
 ### Added

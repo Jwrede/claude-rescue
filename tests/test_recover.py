@@ -61,6 +61,19 @@ def test_get_last_prompt(fragmented_session):
     assert _get_last_prompt(fragmented_session) == "chain one"
 
 
+def test_get_last_prompt_returns_last_occurrence(tmp_path):
+    """`lastPrompt` is updated per-entry; we must return the final one to match
+    what `claude resume` displays."""
+    path = tmp_path / "session.jsonl"
+    entries = [
+        {"uuid": "a", "parentUuid": None, "lastPrompt": "first prompt"},
+        {"uuid": "b", "parentUuid": "a", "lastPrompt": "middle prompt"},
+        {"uuid": "c", "parentUuid": "b", "lastPrompt": "latest prompt"},
+    ]
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    assert _get_last_prompt(path) == "latest prompt"
+
+
 def test_in_place_recovery(fragmented_session, project_dir):
     original_stem = fragmented_session.stem
     root_count, written, meta, out_path, new_id, already = _recover_file(
