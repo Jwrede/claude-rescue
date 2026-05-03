@@ -198,6 +198,11 @@ def _find_best_chain(
     return selected_uuids, ranked
 
 
+def _encode_project_path(p: Path) -> str:
+    """Encode a filesystem path the same way Claude Code does: replace / and _ with -."""
+    return str(p).replace("/", "-").replace("_", "-")
+
+
 def find_project_dir(project_path: str | None) -> Path:
     if not project_path:
         return PROJECTS_DIR
@@ -205,7 +210,7 @@ def find_project_dir(project_path: str | None) -> Path:
     # If the path exists but contains no jsonl files, treat it as a working
     # directory and map it to the corresponding Claude project folder.
     if p.exists() and not any(p.rglob("*.jsonl")):
-        encoded = str(p).replace("/", "-")
+        encoded = _encode_project_path(p)
         candidate = PROJECTS_DIR / encoded
         if candidate.exists():
             return candidate
