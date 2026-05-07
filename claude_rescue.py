@@ -207,13 +207,11 @@ def find_project_dir(project_path: str | None) -> Path:
     if not project_path:
         return PROJECTS_DIR
     p = Path(project_path).expanduser().resolve()
-    # If the path exists but contains no jsonl files, treat it as a working
-    # directory and map it to the corresponding Claude project folder.
-    if p.exists() and not any(p.rglob("*.jsonl")):
-        encoded = _encode_project_path(p)
-        candidate = PROJECTS_DIR / encoded
-        if candidate.exists():
-            return candidate
+    # Always try mapping to the Claude project folder first.
+    encoded = _encode_project_path(p)
+    candidate = PROJECTS_DIR / encoded
+    if candidate.exists():
+        return candidate
     return p
 
 
